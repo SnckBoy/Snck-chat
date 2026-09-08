@@ -110,7 +110,6 @@ model Message {
   reactions      MessageReaction[]
   replyTo        Message?           @relation("replies", fields: [replyToId], references: [id], onDelete: SetNull)
   replies        Message[]          @relation("replies")
-  reports        Report[]            @relation("message")
   @@index([conversationId, createdAt])
   @@index([authorId, createdAt])
 }
