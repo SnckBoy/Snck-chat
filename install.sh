@@ -92,7 +92,18 @@ setup_db(){
 }
 
 clone_or_use_repo(){
-  if [[ -f "$APP_DIR/package.json" && -f "$APP_DIR/src/server.js" ]]; then ok "Using existing source: $APP_DIR"; return 0; fi
+  if [[ -f "$APP_DIR/package.json" && -f "$APP_DIR/src/server.js" ]]; then
+    ok "Using existing source: $APP_DIR"
+    # If this is a Git checkout, sync the installer-run source before building.
+    # This fixes partially completed older installs without deleting local .env.
+    if [[ -d "$APP_DIR/.git" ]]; then
+      cd "$APP_DIR"
+      log "Checking for latest Snck Chat fixes..."
+      git pull --ff-only origin main || fail "Existing checkout has local changes or cannot be updated automatically. Use SNCK_DIR for a clean checkout or resolve the Git changes first."
+      ok "Source updated from main"
+    fi
+    return 0
+  fi
   mkdir -p "$(dirname "$APP_DIR")"
   [[ ! -e "$APP_DIR" ]] || fail "$APP_DIR exists but is not a Snck Chat checkout. Use SNCK_DIR to choose another directory."
   git clone --depth 1 "$REPO_URL" "$APP_DIR"
@@ -222,87 +233,59 @@ verify(){
 }
 
 install_app(){
-  check_os
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  install_deps; setup_user; prepare_app
-  if [[ "$IS_CODESPACE" == "true" ]]; then
-    warn "Workspace mode: systemd/Nginx are skipped; GitHub will forward port 3000."
-  else
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    write_service; write_nginx
-    systemctl daemon-reload; systemctl enable --now "$SERVICE"
-    nginx -t; systemctl reload nginx
-  fi
-  verify
+  check_os; [[ "$IS_CODESPACE" == "true" ]] || need_root; install_deps; setup_user; prepare_app
+  if [[ "$IS_CODESPACE" == "true" ]]; then log "Codespace detected; skipping systemd/Nginx."; verify; return; fi
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+  write_service; write_nginx; systemctl daemon-reload; systemctl enable --now "$SERVICE"; nginx -t; systemctl reload nginx; verify
 }
 
 update_app(){
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  [[ -d "$APP_DIR/.git" ]] || fail "No Snck Chat installation found at $APP_DIR."
-  cd "$APP_DIR"; step "Updating Snck Chat"; git pull --ff-only; prepare_app
-  if [[ "$IS_CODESPACE" != "true" ]]; then chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t && systemctl reload nginx; fi
-  verify; ok "Update complete"
+  [[ "$IS_CODESPACE" == "true" ]] || need_root; [[ -d "$APP_DIR/.git" ]] || fail "No Snck Chat installation found."; cd "$APP_DIR"; git pull --ff-only; prepare_app
+  if [[ "$IS_CODESPACE" == "true" ]]; then verify; else chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t && systemctl reload nginx; verify; fi
 }
 
 repair(){
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  [[ -d "$APP_DIR" ]] || fail "No Snck Chat installation found."
-  prepare_app
-  if [[ "$IS_CODESPACE" != "true" ]]; then chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t && systemctl reload nginx; fi
-  verify; ok "Repair complete"
+  [[ "$IS_CODESPACE" == "true" ]] || need_root; [[ -d "$APP_DIR" ]] || fail "No Snck Chat installation found."; prepare_app
+  if [[ "$IS_CODESPACE" == "true" ]]; then verify; else chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t && systemctl reload nginx; verify; fi
 }
 
 create_admin(){
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  [[ -f "$APP_DIR/src/create-admin.js" ]] || fail "Install Snck Chat first."
-  load_env; cd "$APP_DIR"
+  [[ "$IS_CODESPACE" == "true" ]] || need_root; [[ -f "$APP_DIR/src/create-admin.js" ]] || fail "Install Snck Chat first."; load_env; cd "$APP_DIR"
   if [[ "$IS_CODESPACE" == "true" ]]; then node src/create-admin.js; else sudo -u "$APP_USER" env NODE_ENV=production DATABASE_URL="$DATABASE_URL" node src/create-admin.js; fi
 }
 
 uninstall_app(){
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  read -r -p 'Type UNINSTALL to continue: ' confirm
-  [[ "$confirm" == "UNINSTALL" ]] || { warn "Cancelled."; return; }
-  if [[ "$IS_CODESPACE" != "true" ]]; then
-    systemctl disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE}.service" "/etc/nginx/sites-enabled/${SERVICE}" "/etc/nginx/sites-available/${SERVICE}"
-    systemctl daemon-reload; nginx -t && systemctl reload nginx || true
-  fi
-  warn "Application files and database preserved at $APP_DIR for safety."
-  ok "Uninstall completed"
+  [[ "$IS_CODESPACE" == "true" ]] || need_root; read -r -p 'Type UNINSTALL to continue: ' confirm; [[ "$confirm" == "UNINSTALL" ]] || { echo "Cancelled."; return; }
+  if [[ "$IS_CODESPACE" != "true" ]]; then systemctl disable --now "$SERVICE" 2>/dev/null || true; rm -f "/etc/systemd/system/${SERVICE}.service" "/etc/nginx/sites-enabled/${SERVICE}" "/etc/nginx/sites-available/${SERVICE}"; systemctl daemon-reload; nginx -t && systemctl reload nginx || true; fi
+  echo "Application files and database were preserved for safety at $APP_DIR."
 }
 
 first_install(){
+  banner
   install_app
-  echo; line; printf '%b\n' "${YELLOW}${BOLD}ADMIN SETUP${RESET}"
-  read -r -p 'Create admin account now? [Y/n]: ' answer </dev/tty || answer=n
-  if [[ ! "$answer" =~ ^[Nn]$ ]]; then create_admin; else warn "Skipped. Use option 2 later."; fi
+  echo
+  read -r -p 'Create the first admin account now? [Y/n]: ' answer </dev/tty || answer=n
+  if [[ ! "$answer" =~ ^[Nn]$ ]]; then create_admin; fi
 }
 
 menu(){
   while true; do
     banner
-    echo
-    printf '%b\n' "${DIM}Environment: ${RESET}${BOLD}$([[ "$IS_CODESPACE" == "true" ]] && echo 'GitHub Workspace' || echo 'Ubuntu VPS')${RESET}"
-    printf '%b\n\n' "${DIM}Install path: $APP_DIR${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}1${RESET}  ${WHITE}${BOLD}Install Website${RESET}       ${DIM}Full installation${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}2${RESET}  ${WHITE}${BOLD}Create Admin User${RESET}     ${DIM}Secure admin account${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}3${RESET}  ${WHITE}${BOLD}Update Website${RESET}        ${DIM}Latest code + migrations${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}4${RESET}  ${WHITE}${BOLD}Repair Installation${RESET}  ${DIM}Repair dependencies/services${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}5${RESET}  ${WHITE}${BOLD}Uninstall${RESET}             ${DIM}Disable safely${RESET}"
-    printf '%b\n' "  ${CYAN}${BOLD}6${RESET}  ${WHITE}${BOLD}Exit${RESET}                  ${DIM}Quit${RESET}"
-    echo; line
-    read -r -p '  Select an option [1-6]: ' choice </dev/tty
-    echo
-    case "$choice" in
-      1) install_app;; 2) create_admin;; 3) update_app;; 4) repair;; 5) uninstall_app;; 6) exit 0;; *) warn "Invalid option. Choose 1-6.";;
-    esac
-    echo; read -r -p '  Press Enter to return to menu...' _ </dev/tty || true
+    printf '%b\n' "${WHITE}${BOLD}  1${RESET}  Install Website       ${DIM}Full installation${RESET}"
+    printf '%b\n' "${WHITE}${BOLD}  2${RESET}  Create Admin User     ${DIM}Secure admin account${RESET}"
+    printf '%b\n' "${WHITE}${BOLD}  3${RESET}  Update Website        ${DIM}Latest code + migrations${RESET}"
+    printf '%b\n' "${WHITE}${BOLD}  4${RESET}  Repair Installation   ${DIM}Repair dependencies/services${RESET}"
+    printf '%b\n' "${WHITE}${BOLD}  5${RESET}  Uninstall             ${DIM}Disable safely${RESET}"
+    printf '%b\n' "${WHITE}${BOLD}  6${RESET}  Exit                  ${DIM}Quit${RESET}"
+    line
+    read -r -p '  Select an option: ' choice </dev/tty
+    case "$choice" in 1) install_app;; 2) create_admin;; 3) update_app;; 4) repair;; 5) uninstall_app;; 6) exit 0;; *) warn 'Invalid option. Choose 1-6.';; esac
+    echo; read -r -p '  Press Enter to continue...' _ </dev/tty || true
   done
 }
 
-# Exact one-command installer defaults to a full installation + optional admin creation.
-# Add "menu" when you specifically want the interactive management menu.
+# No argument intentionally means INSTALL, allowing the exact one-command URL:
+# curl -fsSL https://raw.githubusercontent.com/SnckBoy/Snck-chat/main/install.sh -o /tmp/snck-install.sh && sudo bash /tmp/snck-install.sh
 case "${1:-install}" in
   install) first_install;;
   admin) create_admin;;
@@ -310,5 +293,5 @@ case "${1:-install}" in
   repair) repair;;
   uninstall) uninstall_app;;
   menu) menu;;
-  *) printf '%b\n' "${RED}Usage:${RESET} $0 [install|admin|update|repair|uninstall|menu]"; exit 2;;
+  *) fail "Usage: $0 [install|admin|update|repair|uninstall|menu]";;
 esac
