@@ -7,6 +7,9 @@ APP_USER="snckchat"
 NODE_MAJOR=20
 DEFAULT_VPS_DIR="/opt/snck-chat"
 
+# Always start from a directory that cannot disappear while the installer runs.
+cd / 2>/dev/null || true
+
 if [[ -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE}" ]]; then
   APP_DIR="${SNCK_DIR:-$GITHUB_WORKSPACE}"
   WORKSPACE_MODE=true
@@ -34,7 +37,7 @@ ok(){ printf '%b\n' "${GREEN}✔${RESET} $*"; }
 warn(){ printf '%b\n' "${YELLOW}⚠${RESET} $*"; }
 info(){ printf '%b\n' "${BLUE}◆${RESET} $*"; }
 die(){ printf '%b\n' "${RED}✖ ERROR:${RESET} $*" >&2; exit 1; }
-trap 'die "Installation stopped at line $LINENO. See the error above."' ERR
+trap 'printf "%b\n" "${RED}✖ ERROR:${RESET} Installer failed at line $LINENO. Command: $BASH_COMMAND" >&2; exit 1' ERR
 
 require_root(){ [[ $EUID -eq 0 ]] || die "Run with sudo/root on an Ubuntu VPS."; }
 have_systemd(){ command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
@@ -62,9 +65,14 @@ install_deps(){
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
     DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
   fi
+
   command -v node >/dev/null 2>&1 || die "Node.js installation failed."
   command -v npm >/dev/null 2>&1 || die "npm installation failed."
-  ok "Node $(node -v) • npm $(npm -v)"
+  local node_version npm_version
+  node_version="$(node -v)" || die "Unable to execute node."
+  npm_version="$(npm -v)" || die "Unable to execute npm. Check the Node.js/npm installation."
+  [[ -n "$node_version" && -n "$npm_version" ]] || die "Node.js/npm version check returned an empty value."
+  ok "Node $node_version • npm $npm_version"
 }
 
 setup_user(){
@@ -106,6 +114,10 @@ SQL
 }
 
 clone_or_update(){
+  # The caller's cwd may be inside /opt/snck-chat from a previous failed run.
+  # Return to / before changing/removing the application directory.
+  cd / 2>/dev/null || die "Cannot access the filesystem root."
+
   if [[ -f "$APP_DIR/package.json" && -f "$APP_DIR/src/server.js" ]]; then
     ok "Using existing source: $APP_DIR"
     if [[ -d "$APP_DIR/.git" ]]; then
@@ -117,6 +129,7 @@ clone_or_update(){
     fi
     return 0
   fi
+
   mkdir -p "$(dirname "$APP_DIR")"
   if [[ -e "$APP_DIR" && -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
     die "$APP_DIR exists and is not an empty Snck Chat directory. Use SNCK_DIR to choose another path."
@@ -161,7 +174,7 @@ prepare_app(){
   write_env
   load_env
   require_database_url
-  cd "$APP_DIR"
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
 
   step "Installing application dependencies"
   npm install --include=dev
@@ -175,8 +188,6 @@ prepare_app(){
   npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
   ok "Prisma Client generated"
 
-  # Do not call `prisma db execute` here. The installer uses the explicit
-  # schema synchronization command below and PostgreSQL directly for seed SQL.
   step "Synchronizing database schema"
   npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
   ok "Database schema synchronized"
@@ -219,37 +230,31 @@ ReadWritePaths=${APP_DIR}
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "$SERVICE" >/dev/null
-  ok "systemd service configured"
 }
 
 write_nginx(){
   [[ "$WORKSPACE_MODE" == true ]] && return 0
-  cat > "/etc/nginx/sites-available/${SERVICE}" <<'EOF'
+  cat > /etc/nginx/sites-available/snck-chat <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
     client_max_body_size 10M;
+
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
     }
 }
 EOF
-  ln -sfn "/etc/nginx/sites-available/${SERVICE}" "/etc/nginx/sites-enabled/${SERVICE}"
+  ln -sfn /etc/nginx/sites-available/snck-chat /etc/nginx/sites-enabled/snck-chat
   rm -f /etc/nginx/sites-enabled/default
-  nginx -t >/dev/null
-  ok "Nginx + WebSocket proxy configured"
 }
 
 health_check(){
@@ -257,49 +262,38 @@ health_check(){
   require_database_url
   local port="${PORT:-3000}"
   step "Running final health check"
-  if [[ "$WORKSPACE_MODE" == true ]]; then
-    local logfile pid
-    logfile="$(mktemp)"
-    node "$APP_DIR/src/server.js" >"$logfile" 2>&1 & pid=$!
-    sleep 3
+
+  if [[ "$WORKSPACE_MODE" != true ]] && have_systemd; then
+    systemctl is-active --quiet "$SERVICE" || { systemctl --no-pager --full status "$SERVICE"; die "Snck Chat service failed to start."; }
+    curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null || { journalctl -u "$SERVICE" -n 80 --no-pager; die "Application health check failed."; }
+  else
+    local log_file pid
+    log_file="$(mktemp)"
+    node "$APP_DIR/src/server.js" >"$log_file" 2>&1 & pid=$!
+    sleep 2
     if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then
-      cat "$logfile"
+      cat "$log_file"
       kill "$pid" 2>/dev/null || true
-      rm -f "$logfile"
+      rm -f "$log_file"
       die "Application health check failed."
     fi
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    rm -f "$logfile"
-  else
-    systemctl restart "$SERVICE"
-    sleep 2
-    if ! systemctl is-active --quiet "$SERVICE"; then
-      journalctl -u "$SERVICE" -n 100 --no-pager
-      die "Snck Chat service failed to start."
-    fi
-    if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then
-      journalctl -u "$SERVICE" -n 100 --no-pager
-      die "Application health check failed."
-    fi
-    nginx -t >/dev/null
-    systemctl reload nginx
+    rm -f "$log_file"
   fi
   ok "Health check passed"
 }
 
 print_ready(){
   load_env
-  echo
-  line
-  printf '%b\n' "${GREEN}${BOLD}                    ✔ SNCK CHAT READY${RESET}"
-  line
+  echo; line
+  printf '%b\n' "${GREEN}${BOLD}                    ✔ SNCK CHAT READY${RESET}"; line
   printf '%b\n' "${CYAN}Directory:${RESET} $APP_DIR"
   printf '%b\n' "${CYAN}Port:${RESET}      ${PORT:-3000}"
   if [[ "$WORKSPACE_MODE" == true ]]; then
-    printf '%b\n' "${CYAN}Mode:${RESET}      GitHub Workspace/Codespaces"
+    printf '%b\n' "${CYAN}Mode:${RESET}      GitHub Workspace"
     printf '%b\n' "${CYAN}Start:${RESET}     npm start"
-    printf '%b\n' "${CYAN}Next:${RESET}      Forward port ${PORT:-3000}"
+    printf '%b\n' "${CYAN}Next:${RESET}      Forward port ${PORT:-3000} in the Ports tab"
   else
     printf '%b\n' "${CYAN}Mode:${RESET}      Ubuntu VPS"
     printf '%b\n' "${CYAN}Service:${RESET}   $SERVICE"
@@ -311,119 +305,143 @@ print_ready(){
 install_app(){
   check_os
   [[ "$WORKSPACE_MODE" == true ]] || require_root
+  cd / 2>/dev/null || die "Cannot access the filesystem root."
   install_deps
   setup_user
-  prepare_app
-  if [[ "$WORKSPACE_MODE" != true ]]; then
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chmod 600 "$APP_DIR/.env"
-    write_service
-    write_nginx
-  fi
-  health_check
-  print_ready
-}
-
-update_app(){
-  check_os
-  [[ "$WORKSPACE_MODE" == true ]] || require_root
-  [[ -d "$APP_DIR/.git" ]] || die "No Snck Chat Git installation found at $APP_DIR."
   clone_or_update
+  load_env
+  setup_db
+  write_env
   load_env
   require_database_url
   prepare_app
-  if [[ "$WORKSPACE_MODE" != true ]]; then
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chmod 600 "$APP_DIR/.env"
-    write_service
-    write_nginx
-  fi
-  health_check
-  print_ready
-}
 
-repair(){
-  check_os
-  [[ "$WORKSPACE_MODE" == true ]] || require_root
-  [[ -d "$APP_DIR" ]] || die "No Snck Chat installation found at $APP_DIR."
-  load_env
-  prepare_app
   if [[ "$WORKSPACE_MODE" != true ]]; then
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
     chmod 600 "$APP_DIR/.env"
     write_service
     write_nginx
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE"
+    nginx -t
+    systemctl reload nginx
   fi
+
   health_check
   print_ready
 }
 
 create_admin(){
+  check_os
   [[ "$WORKSPACE_MODE" == true ]] || require_root
-  [[ -f "$APP_DIR/src/create-admin.js" ]] || die "Install Snck Chat first."
+  cd / 2>/dev/null || die "Cannot access the filesystem root."
+  clone_or_update
   load_env
   require_database_url
-  cd "$APP_DIR"
-  step "Creating administrator account"
-  if [[ "$WORKSPACE_MODE" == true ]]; then
-    env NODE_ENV=production DATABASE_URL="$DATABASE_URL" node src/create-admin.js
-  else
-    sudo -u "$APP_USER" env NODE_ENV=production DATABASE_URL="$DATABASE_URL" node src/create-admin.js
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
+  npm install --include=dev >/dev/null
+  npx prisma generate --schema "$APP_DIR/prisma/schema.prisma" >/dev/null
+  node scripts/create-admin.js
+}
+
+update_app(){
+  check_os
+  [[ "$WORKSPACE_MODE" == true ]] || require_root
+  cd / 2>/dev/null || die "Cannot access the filesystem root."
+  clone_or_update
+  load_env
+  require_database_url
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
+  npm install --include=dev
+  npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
+  npm run check
+  npm test
+  if [[ "$WORKSPACE_MODE" != true ]]; then
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+    systemctl restart "$SERVICE"
+    nginx -t
+    systemctl reload nginx
   fi
+  health_check
+  print_ready
+}
+
+repair_app(){
+  check_os
+  [[ "$WORKSPACE_MODE" == true ]] || require_root
+  cd / 2>/dev/null || die "Cannot access the filesystem root."
+  clone_or_update
+  load_env
+  require_database_url
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
+  npm install --include=dev
+  npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
+  npm run check
+  npm test
+  if [[ "$WORKSPACE_MODE" != true ]]; then
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+    write_service
+    write_nginx
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE"
+    nginx -t
+    systemctl reload nginx
+  fi
+  health_check
+  print_ready
 }
 
 uninstall_app(){
-  [[ "$WORKSPACE_MODE" == true ]] || require_root
-  banner
-  warn "This removes the Snck Chat application and service."
-  read -r -p "Type REMOVE to continue: " confirm
-  [[ "$confirm" == "REMOVE" ]] || { info "Uninstall cancelled."; return 0; }
-  if [[ "$WORKSPACE_MODE" != true ]]; then
-    systemctl disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE}.service"
-    rm -f "/etc/nginx/sites-enabled/${SERVICE}" "/etc/nginx/sites-available/${SERVICE}"
-    systemctl daemon-reload
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-    userdel "$APP_USER" 2>/dev/null || true
+  check_os
+  require_root
+  if have_systemd; then systemctl disable --now "$SERVICE" 2>/dev/null || true; fi
+  rm -f "/etc/systemd/system/${SERVICE}.service"
+  if command -v nginx >/dev/null 2>&1; then
+    rm -f /etc/nginx/sites-enabled/snck-chat /etc/nginx/sites-available/snck-chat
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
   fi
-  rm -rf "$APP_DIR"
-  ok "Snck Chat removed"
+  systemctl daemon-reload 2>/dev/null || true
+  if [[ -d "$APP_DIR" ]]; then
+    read -r -p "Delete application directory $APP_DIR? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then rm -rf -- "$APP_DIR"; fi
+  fi
+  ok "Snck Chat service configuration removed"
 }
 
 menu(){
   while true; do
     banner
     line
-    printf '%b\n' "  ${WHITE}${BOLD}1${RESET}  Install Website       ${DIM}Full installation${RESET}"
-    printf '%b\n' "  ${WHITE}${BOLD}2${RESET}  Create Admin User     ${DIM}Secure administrator${RESET}"
-    printf '%b\n' "  ${WHITE}${BOLD}3${RESET}  Update Website        ${DIM}Latest code + schema${RESET}"
-    printf '%b\n' "  ${WHITE}${BOLD}4${RESET}  Repair Installation   ${DIM}Repair dependencies${RESET}"
-    printf '%b\n' "  ${WHITE}${BOLD}5${RESET}  Uninstall             ${DIM}Remove safely${RESET}"
-    printf '%b\n' "  ${WHITE}${BOLD}6${RESET}  Exit                  ${DIM}Quit installer${RESET}"
+    printf '%b\n' "  ${GREEN}1${RESET}  Install Website       ${DIM}Full installation${RESET}"
+    printf '%b\n' "  ${GREEN}2${RESET}  Create Admin User     ${DIM}Secure admin account${RESET}"
+    printf '%b\n' "  ${GREEN}3${RESET}  Update Website        ${DIM}Latest code + database${RESET}"
+    printf '%b\n' "  ${GREEN}4${RESET}  Repair Installation   ${DIM}Repair dependencies/services${RESET}"
+    printf '%b\n' "  ${GREEN}5${RESET}  Uninstall             ${DIM}Disable safely${RESET}"
+    printf '%b\n' "  ${GREEN}6${RESET}  Exit                  ${DIM}Quit${RESET}"
     line
     read -r -p "  Select an option: " choice
     case "$choice" in
-      1) install_app; read -r -p "Press Enter to return to menu..." _ ;;
-      2) create_admin; read -r -p "Press Enter to return to menu..." _ ;;
-      3) update_app; read -r -p "Press Enter to return to menu..." _ ;;
-      4) repair; read -r -p "Press Enter to return to menu..." _ ;;
-      5) uninstall_app; read -r -p "Press Enter to return to menu..." _ ;;
+      1) install_app; read -r -p "Press Enter to continue..." _ ;;
+      2) create_admin; read -r -p "Press Enter to continue..." _ ;;
+      3) update_app; read -r -p "Press Enter to continue..." _ ;;
+      4) repair_app; read -r -p "Press Enter to continue..." _ ;;
+      5) uninstall_app; read -r -p "Press Enter to continue..." _ ;;
       6) exit 0 ;;
       *) warn "Invalid option. Choose 1-6."; sleep 1 ;;
     esac
   done
 }
 
-main(){
-  case "${1:-menu}" in
-    install) install_app ;;
-    admin|create-admin) create_admin ;;
-    update) update_app ;;
-    repair) repair ;;
-    uninstall) uninstall_app ;;
-    menu) menu ;;
-    *) die "Usage: $0 [menu|install|admin|update|repair|uninstall]" ;;
-  esac
-}
-
-main "$@"
+case "${1:-install}" in
+  install) install_app ;;
+  admin) create_admin ;;
+  update) update_app ;;
+  repair) repair_app ;;
+  uninstall) uninstall_app ;;
+  menu) menu ;;
+  *) die "Unknown command '$1'. Use: install, admin, update, repair, uninstall, or menu." ;;
+esac
