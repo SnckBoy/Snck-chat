@@ -1,0 +1,32 @@
+name: Restore server source
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    if: github.sha != '9efedd9478fbf1dbc319924992e5633d4530d859'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Restore known-good server implementation
+        run: |
+          git checkout 9efedd9478fbf1dbc319924992e5633d4530d859 -- src/server.js
+          node --check src/server.js
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet -- src/server.js; then
+            echo 'No restoration needed.'
+            exit 0
+          fi
+          git add src/server.js
+          git commit -m 'fix: restore complete server implementation'
+          git push origin HEAD:main
