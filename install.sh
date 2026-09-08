@@ -22,9 +22,7 @@ info(){ printf '%b\n' "${BLUE}◆${R} $*"; }
 die(){ printf '%b\n' "${RED}✖ ERROR:${R} $*" >&2; exit 1; }
 trap 'rc=$?; printf "%b\n" "${RED}✖ ERROR:${R} Installer failed at line $LINENO. Command: $BASH_COMMAND" >&2; exit "$rc"' ERR
 
-# Always recover from a deleted launch directory before doing any filesystem work.
-cd / || exit 1
-
+cd / || die "Cannot access filesystem root."
 WORKSPACE_MODE=false
 if [[ "${CODESPACES:-}" == "true" && -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE}" ]]; then
   APP_DIR="${SNCK_DIR:-$GITHUB_WORKSPACE}"
@@ -38,7 +36,7 @@ check_os(){
   . /etc/os-release
   [[ "${ID:-}" == ubuntu ]] || die "This installer supports Ubuntu only."
   ok "Ubuntu ${VERSION_ID:-unknown} detected"
-  if [[ "$WORKSPACE_MODE" == true ]]; then ok "GitHub Workspace/Codespaces mode"; else ok "Ubuntu VPS production mode"; fi
+  [[ "$WORKSPACE_MODE" == true ]] && ok "GitHub Workspace/Codespaces mode" || ok "Ubuntu VPS production mode"
 }
 
 install_deps(){
@@ -49,26 +47,30 @@ install_deps(){
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
   local major=0
-  if command -v node >/dev/null 2>&1; then major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0')"; fi
+  if command -v node >/dev/null 2>&1; then major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"; fi
   [[ "$major" =~ ^[0-9]+$ ]] || major=0
   if (( major < NODE_MAJOR )); then
     info "Installing Node.js ${NODE_MAJOR}.x"
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
     DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
   fi
-  command -v node >/dev/null 2>&1 || die "Node.js installation failed."
-  command -v npm >/dev/null 2>&1 || die "npm installation failed."
-  local node_version npm_version
-  node_version="$(node --version)" || die "Node.js version check failed."
-  npm_version="$(npm --version)" || die "npm version check failed."
-  [[ -n "$node_version" && -n "$npm_version" ]] || die "Node.js/npm version check returned an empty value."
-  ok "Node $node_version • npm $npm_version"
+  command -v node >/dev/null || die "Node.js installation failed."
+  command -v npm >/dev/null || die "npm installation failed."
+  local nv mv
+  nv="$(node --version)" || die "Node.js version check failed."
+  mv="$(npm --version)" || die "npm version check failed."
+  ok "Node $nv • npm $mv"
 }
 
 setup_user(){
   [[ "$WORKSPACE_MODE" == true ]] && return 0
-  if ! id "$APP_USER" >/dev/null 2>&1; then useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"; fi
-  ok "Service user ready: $APP_USER"
+  if ! id "$APP_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
+  fi
+  local primary_group
+  primary_group="$(id -gn "$APP_USER")"
+  [[ -n "$primary_group" ]] || die "Could not determine service user's primary group."
+  ok "Service user ready: $APP_USER ($primary_group)"
 }
 
 start_postgres(){
@@ -81,18 +83,18 @@ sql_escape(){ printf '%s' "$1" | sed "s/'/''/g"; }
 
 setup_db(){
   step "Configuring PostgreSQL"
-  if [[ -n "${DATABASE_URL:-}" ]]; then info "Using configured DATABASE_URL."; return 0; fi
   start_postgres || die "PostgreSQL is not reachable on 127.0.0.1:5432."
   DBPASS="${SNCK_DB_PASSWORD:-$(openssl rand -hex 32)}"
   local escaped
   escaped="$(sql_escape "$DBPASS")"
-  # Avoid psql's :'variable' syntax because it can fail depending on command/quoting context.
   if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='snck'" | grep -q '1'; then
     sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER ROLE snck WITH LOGIN PASSWORD '${escaped}';"
   else
     sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE snck WITH LOGIN PASSWORD '${escaped}';"
   fi
-  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='snck_chat'" | grep -q '1'; then sudo -u postgres createdb -O snck snck_chat; fi
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='snck_chat'" | grep -q '1'; then
+    sudo -u postgres createdb -O snck snck_chat
+  fi
   ok "Database ready: snck_chat"
 }
 
@@ -103,12 +105,19 @@ clone_or_update(){
     if [[ -d "$APP_DIR/.git" ]]; then
       cd "$APP_DIR"
       info "Checking for latest Snck Chat fixes..."
-      if git fetch --quiet origin main; then git reset --hard --quiet origin/main || die "Could not update the existing source."; ok "Source updated from main"; else warn "Could not contact GitHub; continuing with existing source."; fi
+      if git fetch --quiet origin main; then
+        git reset --hard --quiet origin/main || die "Could not update existing source."
+        ok "Source updated from main"
+      else
+        warn "GitHub unavailable; continuing with existing source."
+      fi
     fi
     return 0
   fi
   mkdir -p "$(dirname "$APP_DIR")"
-  if [[ -e "$APP_DIR" && -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then die "$APP_DIR exists and is not an empty Snck Chat directory. Set SNCK_DIR to another path."; fi
+  if [[ -e "$APP_DIR" && -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
+    die "$APP_DIR exists and is not an empty Snck Chat directory. Set SNCK_DIR to another path."
+  fi
   git clone --depth 1 "$REPO_URL" "$APP_DIR" || die "Git clone failed."
   ok "Snck Chat source downloaded"
 }
@@ -135,25 +144,25 @@ ADMIN_SESSION_DAYS=8
 EOF
     chmod 600 "$APP_DIR/.env"
     ok "Production .env generated"
-    return
+  else
+    if ! grep -Eq '^DATABASE_URL=' "$APP_DIR/.env"; then
+      [[ -n "${DBPASS:-}" ]] || DBPASS="${SNCK_DB_PASSWORD:-$(openssl rand -hex 32)}"
+      printf '\nDATABASE_URL=postgresql://snck:%s@127.0.0.1:5432/snck_chat\n' "$DBPASS" >> "$APP_DIR/.env"
+      ok "DATABASE_URL added to existing .env"
+    fi
+    grep -Eq '^PORT=' "$APP_DIR/.env" || printf 'PORT=%s\n' "${SNCK_PORT:-3000}" >> "$APP_DIR/.env"
+    grep -Eq '^NODE_ENV=' "$APP_DIR/.env" || printf 'NODE_ENV=production\n' >> "$APP_DIR/.env"
+    chmod 600 "$APP_DIR/.env"
+    warn "Existing .env preserved and repaired where required"
   fi
-  if ! grep -Eq '^DATABASE_URL=' "$APP_DIR/.env"; then
-    [[ -n "${DBPASS:-}" ]] || DBPASS="${SNCK_DB_PASSWORD:-$(openssl rand -hex 32)}"
-    printf '\nDATABASE_URL=postgresql://snck:%s@127.0.0.1:5432/snck_chat\n' "$DBPASS" >> "$APP_DIR/.env"
-    ok "DATABASE_URL added to existing .env"
-  fi
-  if ! grep -Eq '^PORT=' "$APP_DIR/.env"; then printf 'PORT=%s\n' "${SNCK_PORT:-3000}" >> "$APP_DIR/.env"; fi
-  if ! grep -Eq '^NODE_ENV=' "$APP_DIR/.env"; then printf 'NODE_ENV=production\n' >> "$APP_DIR/.env"; fi
-  chmod 600 "$APP_DIR/.env"
-  warn "Existing .env preserved and repaired where required"
 }
 
-require_database_url(){ load_env; [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL is missing from $APP_DIR/.env and could not be created."; }
+require_database_url(){ load_env; [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL is missing from $APP_DIR/.env."; }
 
 prepare_app(){
   cd / || die "Cannot access filesystem root."
   load_env
-  setup_db
+  if [[ -z "${DATABASE_URL:-}" ]]; then setup_db; fi
   write_env
   load_env
   require_database_url
@@ -166,7 +175,10 @@ prepare_app(){
   npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
   step "Synchronizing database schema"
   npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
-  if [[ -f "$APP_DIR/prisma/seed.js" ]]; then step "Initializing database"; node "$APP_DIR/prisma/seed.js"; fi
+  if [[ -f "$APP_DIR/prisma/seed.js" ]]; then
+    step "Initializing database"
+    node "$APP_DIR/prisma/seed.js"
+  fi
   step "Running application checks"
   npm run check
   npm test
@@ -180,10 +192,10 @@ write_service(){
 Description=Snck Chat real-time server
 After=network-online.target postgresql.service
 Wants=network-online.target
+
 [Service]
 Type=simple
 User=${APP_USER}
-Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
 ExecStart=/usr/bin/node ${APP_DIR}/src/server.js
@@ -194,6 +206,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=${APP_DIR}
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -204,6 +217,7 @@ write_nginx(){
   load_env
   local port="${PORT:-3000}"
   [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid PORT in .env: $port"
+  (( port >= 1 && port <= 65535 )) || die "PORT must be between 1 and 65535."
   cat > /etc/nginx/sites-available/snck-chat <<EOF
 server {
     listen 80 default_server;
@@ -226,56 +240,135 @@ EOF
   rm -f /etc/nginx/sites-enabled/default
 }
 
+start_service(){
+  [[ "$WORKSPACE_MODE" == true ]] && return 0
+  step "Starting Snck Chat service"
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE" 2>/dev/null || true
+  systemctl enable "$SERVICE" >/dev/null
+  systemctl restart "$SERVICE"
+  for _ in {1..10}; do
+    if systemctl is-active --quiet "$SERVICE"; then ok "Snck Chat service is running"; return 0; fi
+    sleep 1
+  done
+  journalctl -u "$SERVICE" -n 100 --no-pager || true
+  systemctl --no-pager --full status "$SERVICE" || true
+  die "Snck Chat service did not start. See the service log above."
+}
+
 health_check(){
-  load_env; require_database_url
+  load_env
+  require_database_url
   local port="${PORT:-3000}"
   step "Running final health check"
-  if [[ "$WORKSPACE_MODE" != true ]] && have_systemd; then
-    systemctl is-active --quiet "$SERVICE" || { systemctl --no-pager --full status "$SERVICE"; die "Snck Chat service failed to start."; }
-    curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null || { journalctl -u "$SERVICE" -n 80 --no-pager; die "Application health check failed."; }
+  if [[ "$WORKSPACE_MODE" != true ]]; then
+    curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null || {
+      journalctl -u "$SERVICE" -n 100 --no-pager || true
+      die "Application health check failed."
+    }
   else
     local log_file pid
     log_file="$(mktemp)"
     (cd "$APP_DIR" && node src/server.js) >"$log_file" 2>&1 & pid=$!
     sleep 2
-    if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; die "Application health check failed."; fi
-    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$log_file"
+    if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then
+      cat "$log_file"
+      kill "$pid" 2>/dev/null || true
+      rm -f "$log_file"
+      die "Application health check failed."
+    fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$log_file"
   fi
   ok "Health check passed"
 }
 
 print_ready(){
-  load_env; echo; line
-  printf '%b\n' "${GREEN}${B}                    ✔ SNCK CHAT READY${R}"; line
+  load_env
+  echo
+  line
+  printf '%b\n' "${GREEN}${B}                    ✔ SNCK CHAT READY${R}"
+  line
   printf '%b\n' "${CYAN}Directory:${R} $APP_DIR" "${CYAN}Port:${R}      ${PORT:-3000}"
-  if [[ "$WORKSPACE_MODE" == true ]]; then printf '%b\n' "${CYAN}Mode:${R}      GitHub Workspace" "${CYAN}Start:${R}     npm start" "${CYAN}Next:${R}      Forward port ${PORT:-3000} in the Ports tab"; else printf '%b\n' "${CYAN}Mode:${R}      Ubuntu VPS" "${CYAN}Service:${R}   $SERVICE" "${CYAN}Public:${R}    http://YOUR_VPS_IP"; fi
+  if [[ "$WORKSPACE_MODE" == true ]]; then
+    printf '%b\n' "${CYAN}Mode:${R}      GitHub Workspace" "${CYAN}Start:${R}     npm start" "${CYAN}Next:${R}      Forward port ${PORT:-3000} in the Ports tab"
+  else
+    printf '%b\n' "${CYAN}Mode:${R}      Ubuntu VPS" "${CYAN}Service:${R}   $SERVICE" "${CYAN}Public:${R}    http://YOUR_VPS_IP"
+  fi
   line
 }
 
 install_app(){
-  check_os; require_root; cd / || die "Cannot access filesystem root."; install_deps; setup_user; clone_or_update; prepare_app
+  check_os
+  require_root
+  cd / || die "Cannot access filesystem root."
+  install_deps
+  setup_user
+  clone_or_update
+  prepare_app
   if [[ "$WORKSPACE_MODE" != true ]]; then
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"; chmod 600 "$APP_DIR/.env"; write_service; write_nginx; nginx -t
-    systemctl daemon-reload; systemctl enable --now "$SERVICE"; systemctl is-active --quiet "$SERVICE" || die "Snck Chat service did not start."; nginx -t; systemctl reload nginx
+    chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"
+    chmod 600 "$APP_DIR/.env"
+    write_service
+    write_nginx
+    nginx -t
+    start_service
+    nginx -t
+    systemctl reload nginx
   fi
-  health_check; print_ready
+  health_check
+  print_ready
 }
 
 create_admin(){
-  check_os; require_root; cd / || die "Cannot access filesystem root."; clone_or_update; load_env; require_database_url; cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"; npm install --include=dev; npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"; node src/create-admin.js
+  check_os
+  require_root
+  cd / || die "Cannot access filesystem root."
+  [[ -f "$APP_DIR/package.json" ]] || die "Snck Chat is not installed. Run Install Website first."
+  load_env
+  require_database_url
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
+  npm install --include=dev
+  npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
+  node src/create-admin.js
 }
 
 update_app(){
-  check_os; require_root; cd / || die "Cannot access filesystem root."; clone_or_update; load_env; require_database_url; cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"; npm install --include=dev; npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"; npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"; npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate; npm run check; npm test
-  if [[ "$WORKSPACE_MODE" != true ]]; then chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; nginx -t; systemctl daemon-reload; systemctl restart "$SERVICE"; systemctl is-active --quiet "$SERVICE" || die "Snck Chat service failed after update."; systemctl reload nginx; fi
-  health_check; print_ready
+  check_os
+  require_root
+  cd / || die "Cannot access filesystem root."
+  clone_or_update
+  load_env
+  require_database_url
+  cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
+  npm install --include=dev
+  npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
+  npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
+  npm run check
+  npm test
+  if [[ "$WORKSPACE_MODE" != true ]]; then
+    chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"
+    write_service
+    write_nginx
+    nginx -t
+    start_service
+    systemctl reload nginx
+  fi
+  health_check
+  print_ready
 }
 
 repair_app(){
-  check_os; require_root; cd / || die "Cannot access filesystem root."
-  if [[ ! -d "$APP_DIR" ]]; then mkdir -p "$APP_DIR"; fi
-  clone_or_update; load_env
-  if [[ -z "${DATABASE_URL:-}" ]]; then setup_db; write_env; load_env; fi
+  check_os
+  require_root
+  cd / || die "Cannot access filesystem root."
+  clone_or_update
+  load_env
+  if [[ -z "${DATABASE_URL:-}" ]]; then setup_db; fi
+  write_env
+  load_env
   require_database_url
   cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"
   npm install --include=dev
@@ -283,24 +376,41 @@ repair_app(){
   npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
   npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate
   [[ -f "$APP_DIR/prisma/seed.js" ]] && node "$APP_DIR/prisma/seed.js"
-  npm run check; npm test
-  if [[ "$WORKSPACE_MODE" != true ]]; then chown -R "$APP_USER:$APP_USER" "$APP_DIR"; write_service; write_nginx; nginx -t; systemctl daemon-reload; systemctl enable --now "$SERVICE"; systemctl is-active --quiet "$SERVICE" || die "Snck Chat service failed during repair."; systemctl reload nginx; fi
-  health_check; print_ready
+  npm run check
+  npm test
+  if [[ "$WORKSPACE_MODE" != true ]]; then
+    chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"
+    write_service
+    write_nginx
+    nginx -t
+    start_service
+    systemctl reload nginx
+  fi
+  health_check
+  print_ready
 }
 
 uninstall_app(){
-  check_os; require_root
+  check_os
+  require_root
   if have_systemd; then systemctl disable --now "$SERVICE" 2>/dev/null || true; fi
   rm -f "/etc/systemd/system/${SERVICE}.service"
-  if command -v nginx >/dev/null 2>&1; then rm -f /etc/nginx/sites-enabled/snck-chat /etc/nginx/sites-available/snck-chat; nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true; fi
+  if command -v nginx >/dev/null 2>&1; then
+    rm -f /etc/nginx/sites-enabled/snck-chat /etc/nginx/sites-available/snck-chat
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+  fi
   systemctl daemon-reload 2>/dev/null || true
-  if [[ -d "$APP_DIR" ]]; then read -r -p "Delete application directory $APP_DIR? [y/N]: " ans; [[ "$ans" =~ ^[Yy]$ ]] && rm -rf "$APP_DIR" && ok "Application directory removed" || info "Application files preserved"; fi
+  if [[ -d "$APP_DIR" ]]; then
+    read -r -p "Delete application directory $APP_DIR? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then rm -rf "$APP_DIR"; ok "Application directory removed"; else info "Application files preserved"; fi
+  fi
   ok "Snck Chat service configuration removed"
 }
 
 menu(){
   while true; do
-    banner; line
+    banner
+    line
     printf '%b\n' "  ${CYAN}${B}1${R}  Install Website       Full installation" "  ${CYAN}${B}2${R}  Create Admin User     Secure admin account" "  ${CYAN}${B}3${R}  Update Website        Latest code + database" "  ${CYAN}${B}4${R}  Repair Installation   Repair app/services" "  ${CYAN}${B}5${R}  Uninstall             Remove service safely" "  ${CYAN}${B}6${R}  Exit"
     line
     read -r -p "  Select an option: " choice
