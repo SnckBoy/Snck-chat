@@ -41,9 +41,8 @@ check_os(){
 
 install_deps(){
   step "Installing required dependencies"
-  local packages=(curl git nginx postgresql postgresql-contrib openssl ca-certificates build-essential)
-  if [[ "$IS_CODESPACE" != "true" ]]; then packages+=(sudo)
-  fi
+  local packages=(curl git openssl ca-certificates build-essential)
+  if [[ "$IS_CODESPACE" != "true" ]]; then packages+=(nginx postgresql postgresql-contrib sudo); else packages+=(postgresql postgresql-contrib); fi
   if [[ $EUID -eq 0 ]]; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
@@ -70,9 +69,7 @@ install_deps(){
 
 setup_user(){
   [[ "$IS_CODESPACE" == "true" ]] && return 0
-  if ! id "$APP_USER" >/dev/null 2>&1; then
-    useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
-  fi
+  if ! id "$APP_USER" >/dev/null 2>&1; then useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"; fi
   ok "Service user ready: $APP_USER"
 }
 
@@ -89,20 +86,13 @@ start_postgres(){
 setup_db(){
   step "Configuring PostgreSQL"
   if [[ -n "${DATABASE_URL:-}" ]]; then
-    if start_postgres 2>/dev/null; then
-      log "Using configured DATABASE_URL with local PostgreSQL."
-    else
-      log "Using configured DATABASE_URL (external database)."
-    fi
+    if start_postgres 2>/dev/null; then log "Using configured DATABASE_URL with local PostgreSQL."; else log "Using configured DATABASE_URL (external database)."; fi
     return 0
   fi
-
   start_postgres || fail "PostgreSQL is not reachable."
   DBPASS="${SNCK_DB_PASSWORD:-$(openssl rand -hex 32)}"
   sudo -u postgres psql -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN CREATE ROLE snck LOGIN PASSWORD '${DBPASS}'; EXCEPTION WHEN duplicate_object THEN ALTER ROLE snck WITH LOGIN PASSWORD '${DBPASS}'; END \$\$;"
-  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='snck_chat'" | grep -q 1; then
-    sudo -u postgres createdb -O snck snck_chat
-  fi
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='snck_chat'" | grep -q 1; then sudo -u postgres createdb -O snck snck_chat; fi
   ok "Database ready: snck_chat"
 }
 
@@ -114,12 +104,11 @@ clone_or_update(){
       log "Checking for latest Snck Chat fixes..."
       git fetch origin main
       git reset --hard origin/main
-      git clean -fd -e .env
+      # Do not run git clean: untracked uploads/local data must never be deleted by update/repair.
       ok "Source updated from main"
     fi
     return 0
   fi
-
   mkdir -p "$(dirname "$APP_DIR")"
   [[ ! -e "$APP_DIR" ]] || fail "$APP_DIR exists but is not a Snck Chat checkout. Set SNCK_DIR to another directory."
   git clone --depth 1 "$REPO_URL" "$APP_DIR"
@@ -153,9 +142,7 @@ load_env(){
   fi
 }
 
-require_database_url(){
-  [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is missing from $APP_DIR/.env."
-}
+require_database_url(){ [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is missing from $APP_DIR/.env."; }
 
 prepare_app(){
   clone_or_update
@@ -165,36 +152,27 @@ prepare_app(){
   load_env
   require_database_url
   cd "$APP_DIR"
-
   step "Installing application dependencies"
   npm install
   ok "Dependencies installed"
-
   step "Validating Prisma schema"
   npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"
   ok "Prisma schema valid"
-
   step "Generating Prisma Client"
   npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
   ok "Prisma Client generated"
-
   if [[ ! -d prisma/migrations || -z "$(find prisma/migrations -name '*.sql' -print -quit 2>/dev/null)" ]]; then
     mkdir -p prisma/migrations/0001_init
     npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > prisma/migrations/0001_init/migration.sql
   fi
-
   step "Applying database migrations"
   npx prisma migrate deploy --schema "$APP_DIR/prisma/schema.prisma"
   ok "Database migrations applied"
-
-  # Use PostgreSQL directly for the SQL seed. This avoids Prisma CLI db-execute
-  # argument differences between Prisma 6.x releases.
   if [[ -f "$APP_DIR/prisma/seed.sql" ]]; then
     step "Initializing global chat"
     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$APP_DIR/prisma/seed.sql" >/dev/null
     ok "Global chat initialized"
   fi
-
   step "Running application checks"
   npm run check
   npm test
@@ -238,7 +216,6 @@ server {
     listen [::]:80 default_server;
     server_name _;
     client_max_body_size 10M;
-
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
@@ -259,11 +236,9 @@ EOF
 }
 
 health_check(){
-  load_env
-  require_database_url
+  load_env; require_database_url
   local port="${PORT:-3000}"
   step "Running final health check"
-
   if [[ "$IS_CODESPACE" != "true" ]] && have_systemd; then
     systemctl is-active --quiet "$SERVICE" || { systemctl --no-pager --full status "$SERVICE"; fail "Snck Chat service failed to start."; }
     curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null || { journalctl -u "$SERVICE" -n 80 --no-pager; fail "Application health check failed."; }
@@ -273,47 +248,40 @@ health_check(){
     node src/server.js >"$log_file" 2>&1 & pid=$!
     sleep 2
     if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then
-      cat "$log_file"
-      kill "$pid" 2>/dev/null || true
-      rm -f "$log_file"
-      fail "Application health check failed."
+      cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; fail "Application health check failed."
     fi
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    rm -f "$log_file"
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$log_file"
   fi
   ok "Health check passed"
 }
 
-install_app(){
-  check_os
-  [[ "$IS_CODESPACE" == "true" ]] || need_root
-  install_deps
-  setup_user
-  clone_or_update
+print_ready(){
   load_env
-  setup_db
-  write_env
-  load_env
-  require_database_url
-  prepare_app
-
+  echo; line
+  printf '%b\n' "${GREEN}${BOLD}                    ✔ SNCK CHAT READY${RESET}"; line
+  printf '%b\n' "${CYAN}Directory:${RESET} $APP_DIR"
+  printf '%b\n' "${CYAN}Port:${RESET}      ${PORT:-3000}"
   if [[ "$IS_CODESPACE" == "true" ]]; then
-    health_check
-    print_ready
-    return
+    printf '%b\n' "${CYAN}Mode:${RESET}      GitHub Workspace"
+    printf '%b\n' "${CYAN}Start:${RESET}     npm start"
+    printf '%b\n' "${CYAN}Next:${RESET}      Forward port ${PORT:-3000} in the Ports tab"
+  else
+    printf '%b\n' "${CYAN}Mode:${RESET}      Ubuntu VPS"
+    printf '%b\n' "${CYAN}Service:${RESET}   $SERVICE"
+    printf '%b\n' "${CYAN}Public:${RESET}    http://YOUR_VPS_IP"
   fi
+  line
+}
 
-  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-  chmod 600 "$APP_DIR/.env"
-  write_service
-  write_nginx
-  systemctl daemon-reload
-  systemctl enable --now "$SERVICE"
-  nginx -t
-  systemctl reload nginx
-  health_check
-  print_ready
+install_app(){
+  check_os; [[ "$IS_CODESPACE" == "true" ]] || need_root
+  install_deps; setup_user; prepare_app
+  if [[ "$IS_CODESPACE" == "true" ]]; then health_check; print_ready; return; fi
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"; chmod 600 "$APP_DIR/.env"
+  write_service; write_nginx
+  systemctl daemon-reload; systemctl enable --now "$SERVICE"
+  nginx -t; systemctl reload nginx
+  health_check; print_ready
 }
 
 update_app(){
@@ -321,17 +289,10 @@ update_app(){
   [[ -d "$APP_DIR/.git" ]] || fail "No Snck Chat installation found at $APP_DIR."
   prepare_app
   if [[ "$IS_CODESPACE" != "true" ]]; then
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chmod 600 "$APP_DIR/.env"
-    write_service
-    write_nginx
-    systemctl daemon-reload
-    systemctl restart "$SERVICE"
-    nginx -t
-    systemctl reload nginx
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"; chmod 600 "$APP_DIR/.env"
+    write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t; systemctl reload nginx
   fi
-  health_check
-  print_ready
+  health_check; print_ready
 }
 
 repair(){
@@ -339,26 +300,16 @@ repair(){
   [[ -d "$APP_DIR" ]] || fail "No Snck Chat installation found at $APP_DIR."
   prepare_app
   if [[ "$IS_CODESPACE" != "true" ]]; then
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chmod 600 "$APP_DIR/.env"
-    write_service
-    write_nginx
-    systemctl daemon-reload
-    systemctl restart "$SERVICE"
-    nginx -t
-    systemctl reload nginx
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"; chmod 600 "$APP_DIR/.env"
+    write_service; write_nginx; systemctl daemon-reload; systemctl restart "$SERVICE"; nginx -t; systemctl reload nginx
   fi
-  health_check
-  print_ready
+  health_check; print_ready
 }
 
 create_admin(){
   [[ "$IS_CODESPACE" == "true" ]] || need_root
   [[ -f "$APP_DIR/src/create-admin.js" ]] || fail "Install Snck Chat first."
-  load_env
-  require_database_url
-  cd "$APP_DIR"
-  step "Creating administrator account"
+  load_env; require_database_url; cd "$APP_DIR"; step "Creating administrator account"
   if [[ "$IS_CODESPACE" == "true" ]]; then
     env NODE_ENV=production DATABASE_URL="$DATABASE_URL" node src/create-admin.js
   else
@@ -381,30 +332,9 @@ uninstall_app(){
   ok "Snck Chat application removed. Database was preserved."
 }
 
-print_ready(){
-  load_env
-  echo
-  line
-  printf '%b\n' "${GREEN}${BOLD}                    ✔ SNCK CHAT READY${RESET}"
-  line
-  printf '%b\n' "${CYAN}Directory:${RESET} $APP_DIR\n"
-  printf '%b\n' "${CYAN}Port:${RESET}      ${PORT:-3000}"
-  if [[ "$IS_CODESPACE" == "true" ]]; then
-    printf '%b\n' "${CYAN}Mode:${RESET}      GitHub Workspace"
-    printf '%b\n' "${CYAN}Start:${RESET}     npm start"
-    printf '%b\n' "${CYAN}Next:${RESET}      Forward port ${PORT:-3000} in the Ports tab"
-  else
-    printf '%b\n' "${CYAN}Mode:${RESET}      Ubuntu VPS"
-    printf '%b\n' "${CYAN}Service:${RESET}   $SERVICE"
-    printf '%b\n' "${CYAN}Public:${RESET}    http://YOUR_VPS_IP"
-  fi
-  line
-}
-
 menu(){
   while true; do
-    banner
-    line
+    banner; line
     printf '%b\n' "  ${GREEN}1${RESET}  Install Website       Full installation"
     printf '%b\n' "  ${BLUE}2${RESET}  Create Admin User     Secure admin account"
     printf '%b\n' "  ${MAGENTA}3${RESET}  Update Website        Latest code + migrations"
@@ -434,8 +364,7 @@ main(){
     update) update_app ;;
     repair) repair ;;
     uninstall) uninstall_app ;;
-    help|-h|--help)
-      printf '%s\n' 'Snck Chat installer:' '  install       Install/update and start the application' '  menu          Open the interactive installer menu (default)' '  admin         Create an administrator account' '  update        Update the application' '  repair        Repair dependencies/database/services' '  uninstall     Remove application files/services' ;;
+    help|-h|--help) printf '%s\n' 'Snck Chat installer:' '  install       Install/update and start the application' '  menu          Open the interactive installer menu (default)' '  admin         Create an administrator account' '  update        Update the application' '  repair        Repair dependencies/database/services' '  uninstall     Remove application files/services' ;;
     *) fail "Unknown command: $command. Use: install, menu, admin, update, repair, uninstall" ;;
   esac
 }
