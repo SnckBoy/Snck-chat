@@ -12,21 +12,20 @@ jobs:
     if: github.sha != '9efedd9478fbf1dbc319924992e5633d4530d859'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Restore known-good server implementation
+      - name: Restore complete server from known-good commit
+        shell: bash
         run: |
-          git checkout 9efedd9478fbf1dbc319924992e5633d4530d859 -- src/server.js
+          set -euo pipefail
+          git show 9efedd9478fbf1dbc319924992e5633d4530d859:src/server.js > src/server.js
+          test -s src/server.js
           node --check src/server.js
+          test "$(git show 9efedd9478fbf1dbc319924992e5633d4530d859:src/server.js | sha256sum | cut -d' ' -f1)" = "$(sha256sum src/server.js | cut -d' ' -f1)"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if git diff --quiet -- src/server.js; then
-            echo 'No restoration needed.'
-            exit 0
-          fi
           git add src/server.js
+          if git diff --cached --quiet; then echo 'Already restored'; exit 0; fi
           git commit -m 'fix: restore complete server implementation'
           git push origin HEAD:main
