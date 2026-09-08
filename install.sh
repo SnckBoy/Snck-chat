@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 REPO_URL="https://github.com/SnckBoy/Snck-chat.git"
 SERVICE="snck-chat"
 APP_USER="snckchat"
 APP_DIR="${SNCK_DIR:-/opt/snck-chat}"
 NODE_MAJOR=20
-
 if [[ -t 1 ]]; then R=$'\033[0m'; B=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'; WHITE=$'\033[97m'; else R=''; B=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; WHITE=''; fi
 banner(){ clear 2>/dev/null || true; printf '%b\n' "${CYAN}${B}╔══════════════════════════════════════════════════════════╗${R}" "${CYAN}${B}║${R}                 ${WHITE}${B}SNCK CHAT INSTALLER${R}                 ${CYAN}${B}║${R}" "${CYAN}${B}║${R}       ${B}Production • Realtime • Ubuntu • Workspace${R}       ${CYAN}${B}║${R}" "${CYAN}${B}╚══════════════════════════════════════════════════════════╝${R}"; }
 line(){ printf '%b\n' "${CYAN}────────────────────────────────────────────────────────────${R}"; }
 step(){ printf '\n%b\n' "${MAGENTA}${B}▶ $*${R}"; }; ok(){ printf '%b\n' "${GREEN}✔${R} $*"; }; warn(){ printf '%b\n' "${YELLOW}⚠${R} $*"; }; info(){ printf '%b\n' "${BLUE}◆${R} $*"; }; die(){ printf '%b\n' "${RED}✖ ERROR:${R} $*" >&2; exit 1; }
 trap 'rc=$?; printf "%b\n" "${RED}✖ ERROR:${R} Installer failed at line $LINENO. Command: $BASH_COMMAND" >&2; exit "$rc"' ERR
-
 cd / || die "Cannot access filesystem root."
 WORKSPACE_MODE=false
 if [[ "${CODESPACES:-}" == "true" && -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE}" ]]; then APP_DIR="${SNCK_DIR:-$GITHUB_WORKSPACE}"; WORKSPACE_MODE=true; fi
@@ -57,7 +54,7 @@ prepare_app(){
  cd / || die "Cannot access filesystem root."; load_env; setup_db; write_env; load_env; require_database_url; cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"; step "Installing application dependencies"; npm install --include=dev; step "Validating Prisma schema"; npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"; step "Generating Prisma Client"; npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"; step "Synchronizing database schema"; npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate; if [[ -f "$APP_DIR/prisma/seed.js" ]]; then step "Initializing database"; DATABASE_URL="$DATABASE_URL" node "$APP_DIR/prisma/seed.js"; fi; step "Running application checks"; npm run check; npm test; ok "Application checks passed";
 }
 write_service(){
- [[ "$WORKSPACE_MODE" == true ]] && return 0; local group; group="$(id -gn "$APP_USER")"; load_env; local port="${PORT:-3000}"; cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
+ [[ "$WORKSPACE_MODE" == true ]] && return 0; local group node_bin; group="$(id -gn "$APP_USER")"; node_bin="$(command -v node)"; load_env; local port="${PORT:-3000}"; cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=Snck Chat real-time server
 After=network-online.target postgresql.service
@@ -71,7 +68,7 @@ WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${APP_DIR}/.env
 Environment=NODE_ENV=production
 Environment=PORT=${port}
-ExecStart=/usr/bin/node ${APP_DIR}/src/server.js
+ExecStart=${node_bin} ${APP_DIR}/src/server.js
 Restart=always
 RestartSec=3
 TimeoutStartSec=30
@@ -99,7 +96,18 @@ start_service(){
  for _ in {1..30}; do systemctl is-active --quiet "$SERVICE" && { ok "Snck Chat service is running"; return 0; }; sleep 1; done
  echo; warn "systemd could not keep the service running. Application log:"; journalctl -u "$SERVICE" -n 100 --no-pager || true; systemctl --no-pager --full status "$SERVICE" || true; die "Snck Chat service did not start. The service log above contains the runtime error."
 }
-health_check(){ load_env; require_database_url; local port="${PORT:-3000}"; step "Running final health check"; if [[ "$WORKSPACE_MODE" != true ]]; then curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null || { journalctl -u "$SERVICE" -n 100 --no-pager || true; die "Application health check failed."; }; else local log_file pid; log_file="$(mktemp)"; (cd "$APP_DIR" && node src/server.js) >"$log_file" 2>&1 & pid=$!; sleep 2; if ! curl -fsS --max-time 10 "http://127.0.0.1:${port}/api/health" >/dev/null; then cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; die "Application health check failed."; fi; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$log_file"; fi; ok "Health check passed"; }
+health_check(){
+ load_env; require_database_url; local port="${PORT:-3000}"; step "Running final health check";
+ if [[ "$WORKSPACE_MODE" != true ]]; then
+   local response=""; for _ in {1..30}; do
+     if response="$(curl -4fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null)" && [[ "$response" == *'"ok":true'* ]]; then ok "Health check passed"; return 0; fi
+     systemctl is-active --quiet "$SERVICE" || break; sleep 1;
+   done
+   warn "Health endpoint did not become ready on 127.0.0.1:${port}."; ss -ltnp 2>/dev/null | grep -E ":${port}\b" || true; journalctl -u "$SERVICE" -n 100 --no-pager || true; die "Application health check failed."
+ else
+   local log_file pid; log_file="$(mktemp)"; (cd "$APP_DIR" && node src/server.js) >"$log_file" 2>&1 & pid=$!; for _ in {1..30}; do if curl -4fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null | grep -q '"ok":true'; then ok "Health check passed"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; return 0; fi; if ! kill -0 "$pid" 2>/dev/null; then break; fi; sleep 1; done; cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; die "Application health check failed.";
+ fi
+}
 install_app(){ check_os; require_root; cd /; install_deps; setup_user; clone_or_update; prepare_app; if [[ "$WORKSPACE_MODE" != true ]]; then load_env; chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"; chmod 600 "$APP_DIR/.env"; write_service; write_nginx; nginx -t; start_service; nginx -t; systemctl reload nginx; fi; health_check; }
 create_admin(){ check_os; require_root; cd /; [[ -f "$APP_DIR/package.json" ]] || die "Snck Chat is not installed."; load_env; require_database_url; cd "$APP_DIR"; npm install --include=dev; npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"; node src/create-admin.js; }
 update_app(){ install_app; }
