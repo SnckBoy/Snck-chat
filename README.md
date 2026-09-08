@@ -2,62 +2,101 @@
 
 A production-oriented, username-first real-time chat platform with public chat, private DMs, friends, profiles, notifications, moderation, and a separate administrator system.
 
-## Stack
-
-Node.js 20+, Express 5, Socket.IO, PostgreSQL, Prisma, browser client, Nginx, systemd.
-
-## Authentication
-
-Normal users use a username-first session. A username is not a strong secret: an existing username can only continue from the browser session that created it; otherwise a new username is required. Admin authentication is completely separate and uses a hashed password and its own session cookie.
-
 ## One-command Ubuntu VPS installer
 
-On a clean supported Ubuntu LTS VPS, run:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/SnckBoy/Snck-chat/main/install.sh -o /tmp/snck-install.sh && sudo bash /tmp/snck-install.sh install
-```
-
-The installer will:
-
-1. Detect Ubuntu and required permissions.
-2. Install Node.js, PostgreSQL, Nginx and required packages.
-3. Create a dedicated `snckchat` service user.
-4. Create/configure the PostgreSQL database.
-5. Download Snck Chat.
-6. Install production dependencies.
-7. Generate the Prisma client and initial database migration.
-8. Run migrations and seed the global conversation.
-9. Configure systemd and Nginx.
-10. Start and health-check the application.
-11. Ask whether you want to create the first admin account.
-
-The admin password is entered interactively and is never printed by the installer.
-
-### Installer menu
-
-You can also run the installer menu:
+The exact command below is the supported default. **No `install` argument is required**: when `install.sh` receives no argument, it performs the full installation and then offers to create the first administrator.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SnckBoy/Snck-chat/main/install.sh -o /tmp/snck-install.sh && sudo bash /tmp/snck-install.sh
 ```
 
-Options:
+The installer detects Ubuntu, installs required dependencies, configures PostgreSQL, installs Snck Chat, runs Prisma migrations, configures systemd/Nginx, starts the application, performs a health check, and can create the first admin account.
 
-- `1` Install Website
-- `2` Create Admin User
-- `3` Update Website
-- `4` Repair Installation
-- `5` Uninstall
-- `6` Exit
+It is safe to rerun: an existing `.env` is preserved and its configured `DATABASE_URL` is reused.
 
-### Admin creation only
+## Installer options
+
+The same script supports:
 
 ```bash
-sudo bash /opt/snck-chat/install.sh admin
+sudo bash /tmp/snck-install.sh install
+sudo bash /tmp/snck-install.sh admin
+sudo bash /tmp/snck-install.sh update
+sudo bash /tmp/snck-install.sh repair
+sudo bash /tmp/snck-install.sh uninstall
+sudo bash /tmp/snck-install.sh menu
 ```
 
-Or use the menu's **Create Admin User** option.
+The `menu` command provides:
+
+1. Install Website
+2. Create Admin User
+3. Update Website
+4. Repair Installation
+5. Uninstall
+6. Exit
+
+## GitHub Codespaces / workspace
+
+The installer detects `CODESPACES=true` and `GITHUB_WORKSPACE`. In a Codespace it uses the existing repository workspace, installs dependencies, runs migrations and health checks, and skips VPS-only systemd/Nginx setup. GitHub documents these Codespaces environment variables and the persistent workspace directory. citeturn0search0turn0search1
+
+Run the same installer from the Codespace terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SnckBoy/Snck-chat/main/install.sh -o /tmp/snck-install.sh && bash /tmp/snck-install.sh
+```
+
+For a Codespace, PostgreSQL must be available locally or through `DATABASE_URL`. After setup, run:
+
+```bash
+npm start
+```
+
+Then forward port `3000` in the Codespaces Ports panel.
+
+## Admin account
+
+During a fresh installation, the installer asks whether to create the first administrator. To create one later:
+
+```bash
+sudo bash /tmp/snck-install.sh admin
+```
+
+Or from the installed VPS directory:
+
+```bash
+cd /opt/snck-chat
+sudo node src/create-admin.js
+```
+
+The admin password is hashed and is never printed after creation.
+
+## Stack
+
+- Node.js 20+
+- Express
+- Socket.IO
+- PostgreSQL
+- Prisma
+- Nginx
+- systemd on Ubuntu VPS
+
+## Development
+
+```bash
+cp .env.example .env
+npm install
+npx prisma generate
+npx prisma migrate deploy
+node prisma/seed.js
+npm start
+```
+
+The app listens on port `3000` by default.
+
+## Production domain / HTTPS
+
+The included Nginx configuration proxies HTTP and WebSocket traffic to `127.0.0.1:3000`. Point your DNS record at the VPS, issue an HTTPS certificate with your preferred ACME client, and set `COOKIE_SECURE=true` in `.env` after HTTPS is active.
 
 ## Useful service commands
 
@@ -67,23 +106,6 @@ sudo systemctl restart snck-chat
 sudo journalctl -u snck-chat -f
 curl http://127.0.0.1:3000/api/health
 ```
-
-## Development
-
-```bash
-cp .env.example .env
-npm install
-npx prisma generate
-npx prisma db push
-node prisma/seed.js
-npm run dev
-```
-
-The app listens on port 3000 by default.
-
-## Production domain / HTTPS
-
-The included Nginx configuration proxies HTTP and WebSocket traffic to `127.0.0.1:3000`. Point your DNS record at the VPS, then use an ACME client such as Certbot to issue a certificate and set `COOKIE_SECURE=true` in `.env` after HTTPS is active.
 
 ## API areas
 
@@ -99,11 +121,11 @@ The included Nginx configuration proxies HTTP and WebSocket traffic to `127.0.0.
 
 ## Security
 
-Backend authorization is enforced for private conversations and administrative endpoints. Cookies are HttpOnly/SameSite, sessions are random tokens stored as SHA-256 hashes, admin passwords are bcrypt-hashed, requests are rate limited, Helmet supplies security headers, and message/user inputs are validated with Zod. Never commit `.env` or production credentials.
+Backend authorization is enforced for private conversations and administrative endpoints. Cookies are HttpOnly/SameSite, sessions use random tokens stored as SHA-256 hashes, admin passwords are bcrypt-hashed, requests are rate limited, Helmet supplies security headers, and request data is validated with Zod. Never commit `.env` or production credentials.
 
 ## Data and backups
 
-PostgreSQL is the source of truth. Back up the database before upgrades and keep the backup outside the application directory. The uninstall option intentionally leaves application data in place unless you manually remove it.
+PostgreSQL is the source of truth. Back up the database before upgrades and keep the backup outside the application directory. The uninstall option intentionally preserves application files and database data for safety.
 
 ## Verification
 
