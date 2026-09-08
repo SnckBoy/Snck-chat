@@ -8,27 +8,27 @@ datasource db {
 }
 
 model User {
-  id                String               @id @default(cuid())
-  username          String               @unique
+  id                String                @id @default(cuid())
+  username          String                @unique
   displayName       String
   avatarUrl         String?
-  bio               String               @default("")
-  status            String               @default("online")
-  disabled          Boolean              @default(false)
-  createdAt         DateTime             @default(now())
-  updatedAt         DateTime             @updatedAt
+  bio               String                @default("")
+  status            String                @default("online")
+  disabled          Boolean               @default(false)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
   sessions          Session[]
   messages          Message[]
   reactions         MessageReaction[]
-  sentRequests      FriendRequest[]      @relation("sent")
-  receivedRequests  FriendRequest[]      @relation("received")
-  friendshipsA      Friendship[]         @relation("friendA")
-  friendshipsB      Friendship[]         @relation("friendB")
-  blocksA           Block[]              @relation("blocker")
-  blocksB           Block[]              @relation("blocked")
+  sentRequests      FriendRequest[]       @relation("sent")
+  receivedRequests  FriendRequest[]       @relation("received")
+  friendshipsA      Friendship[]          @relation("friendA")
+  friendshipsB      Friendship[]          @relation("friendB")
+  blocksA           Block[]               @relation("blocker")
+  blocksB           Block[]               @relation("blocked")
   memberships       ConversationMember[]
   notifications     Notification[]
-  reports           Report[]             @relation("reporter")
+  reports           Report[]              @relation("reporter")
 }
 
 model Session {
@@ -149,7 +149,6 @@ model Report {
   createdAt  DateTime  @default(now())
   resolvedAt DateTime?
   reporter   User      @relation("reporter", fields: [reporterId], references: [id], onDelete: Cascade)
-  message    Message?  @relation("message", fields: [targetId], references: [id], onDelete: Cascade)
   @@index([status, createdAt])
   @@index([targetType, targetId])
 }
