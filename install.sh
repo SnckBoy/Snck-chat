@@ -140,7 +140,6 @@ require_database_url(){
 
 prepare_app(){
   clone_or_use_repo
-  # On a fresh install there is no .env yet, so create/configure the database first.
   load_env
   setup_db
   write_env
@@ -151,7 +150,6 @@ prepare_app(){
   step "Installing application dependencies"
   npm install
 
-  # Prisma must always receive a valid schema and DATABASE_URL.
   export DATABASE_URL
   npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"
 
@@ -162,10 +160,10 @@ prepare_app(){
 
   npx prisma migrate deploy --schema "$APP_DIR/prisma/schema.prisma"
 
-  # prisma db execute requires --schema (or --url) with Prisma 6.
-  # The seed is idempotent, so it is safe on install/update/repair.
+  # Seed using the explicit database URL. This avoids Prisma CLI ambiguity
+  # across Prisma 6.x versions when db execute is called from an installer.
   if [[ -f prisma/seed.sql ]]; then
-    npx prisma db execute --schema "$APP_DIR/prisma/schema.prisma" --file "$APP_DIR/prisma/seed.sql"
+    npx prisma db execute --url "$DATABASE_URL" --file "$APP_DIR/prisma/seed.sql"
   fi
 
   npm run check
