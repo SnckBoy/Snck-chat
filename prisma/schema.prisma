@@ -29,7 +29,6 @@ model User {
   memberships    ConversationMember[]
   notifications  Notification[]
   reports        Report[]           @relation("reporter")
-  adminActions   AuditLog[]         @relation("admin")
 }
 
 model Session {
