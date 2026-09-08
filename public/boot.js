@@ -1,1 +1,3 @@
 setInterval(()=>{try{if(typeof socket!=='undefined'&&socket?.connected)socket.emit('conversation:join','global')}catch(_){ }},1000);
+selectGlobal=async function(){current='global';document.querySelector('#chatTitle').textContent='Global Chat';document.querySelector('#chatSub').textContent='Everyone can join';try{const d=await api('/api/conversations/global/messages');messages=d.messages;drawMessages(false)}catch(e){toast(e.message)}};
+send=async function(){const ta=document.querySelector('#composer'),content=ta?.value.trim();if(!content)return;try{const path=current==='global'?'/api/conversations/global/messages':`/api/conversations/${current}/messages`;await api(path,{method:'POST',body:JSON.stringify({content})});ta.value=''}catch(e){toast(e.message)}};
