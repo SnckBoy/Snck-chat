@@ -54,7 +54,7 @@ prepare_app(){
  cd / || die "Cannot access filesystem root."; load_env; setup_db; write_env; load_env; require_database_url; cd "$APP_DIR" || die "Cannot access application directory: $APP_DIR"; step "Installing application dependencies"; npm install --include=dev; step "Validating Prisma schema"; npx prisma validate --schema "$APP_DIR/prisma/schema.prisma"; step "Generating Prisma Client"; npx prisma generate --schema "$APP_DIR/prisma/schema.prisma"; step "Synchronizing database schema"; npx prisma db push --schema "$APP_DIR/prisma/schema.prisma" --skip-generate; if [[ -f "$APP_DIR/prisma/seed.js" ]]; then step "Initializing database"; DATABASE_URL="$DATABASE_URL" node "$APP_DIR/prisma/seed.js"; fi; step "Running application checks"; npm run check; npm test; ok "Application checks passed";
 }
 write_service(){
- [[ "$WORKSPACE_MODE" == true ]] && return 0; local group node_bin; group="$(id -gn "$APP_USER")"; node_bin="$(command -v node)"; load_env; local port="${PORT:-3000}"; cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
+ [[ "$WORKSPACE_MODE" == true ]] && return 0; local group node_bin; group="$(id -gn "$APP_USER")"; node_bin="$(readlink -f "$(command -v node)")"; load_env; local port="${PORT:-3000}"; [[ -x "$node_bin" ]] || die "Node executable is not available at $node_bin."; [[ -f "$APP_DIR/src/launcher.js" ]] || die "Application launcher is missing: $APP_DIR/src/launcher.js"; [[ -f "$APP_DIR/.env" ]] || die "Environment file is missing: $APP_DIR/.env"; cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=Snck Chat real-time server
 After=network-online.target postgresql.service
@@ -65,10 +65,10 @@ Type=simple
 User=${APP_USER}
 Group=${group}
 WorkingDirectory=${APP_DIR}
-EnvironmentFile=-${APP_DIR}/.env
+EnvironmentFile=${APP_DIR}/.env
 Environment=NODE_ENV=production
 Environment=PORT=${port}
-ExecStart=${node_bin} ${APP_DIR}/src/server.js
+ExecStart=${node_bin} ${APP_DIR}/src/launcher.js
 Restart=always
 RestartSec=3
 TimeoutStartSec=30
@@ -85,13 +85,13 @@ EOF
 write_nginx(){ [[ "$WORKSPACE_MODE" == true ]] && return 0; load_env; local port="${PORT:-3000}"; [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid PORT in .env: $port"; (( port>=1 && port<=65535 )) || die "PORT must be between 1 and 65535."; cat > /etc/nginx/sites-available/snck-chat <<EOF
 server {
  listen 80 default_server; listen [::]:80 default_server; server_name _; client_max_body_size 10M;
- location / { proxy_pass http://127.0.0.1:${port}; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; }
+ location / { proxy_pass http://127.0.0.1:${port}; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_read_timeout 75s; proxy_send_timeout 75s; }
 }
 EOF
  ln -sfn /etc/nginx/sites-available/snck-chat /etc/nginx/sites-enabled/snck-chat; rm -f /etc/nginx/sites-enabled/default; }
 start_service(){
  [[ "$WORKSPACE_MODE" == true ]] && return 0; step "Starting Snck Chat service"; load_env; local port="${PORT:-3000}"; systemctl daemon-reload; systemctl reset-failed "$SERVICE" 2>/dev/null || true; systemctl enable "$SERVICE" >/dev/null; systemctl stop "$SERVICE" 2>/dev/null || true
- if ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then warn "Port ${port} is already in use; checking for an old Snck Chat process."; local pids; pids="$(pgrep -f "${APP_DIR}/src/server.js" || true)"; if [[ -n "$pids" ]]; then kill $pids 2>/dev/null || true; sleep 2; fi; fi
+ if ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then warn "Port ${port} is already in use; checking for an old Snck Chat process."; local pids; pids="$(pgrep -f "${APP_DIR}/src/(server|launcher)\.js" || true)"; if [[ -n "$pids" ]]; then kill $pids 2>/dev/null || true; sleep 2; fi; fi
  systemctl start "$SERVICE"
  for _ in {1..30}; do systemctl is-active --quiet "$SERVICE" && { ok "Snck Chat service is running"; return 0; }; sleep 1; done
  echo; warn "systemd could not keep the service running. Application log:"; journalctl -u "$SERVICE" -n 100 --no-pager || true; systemctl --no-pager --full status "$SERVICE" || true; die "Snck Chat service did not start. The service log above contains the runtime error."
@@ -105,7 +105,7 @@ health_check(){
    done
    warn "Health endpoint did not become ready on 127.0.0.1:${port}."; ss -ltnp 2>/dev/null | grep -E ":${port}\b" || true; journalctl -u "$SERVICE" -n 100 --no-pager || true; die "Application health check failed."
  else
-   local log_file pid; log_file="$(mktemp)"; (cd "$APP_DIR" && node src/server.js) >"$log_file" 2>&1 & pid=$!; for _ in {1..30}; do if curl -4fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null | grep -q '"ok":true'; then ok "Health check passed"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; return 0; fi; if ! kill -0 "$pid" 2>/dev/null; then break; fi; sleep 1; done; cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; die "Application health check failed.";
+   local log_file pid; log_file="$(mktemp)"; (cd "$APP_DIR" && node src/launcher.js) >"$log_file" 2>&1 & pid=$!; for _ in {1..30}; do if curl -4fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null | grep -q '"ok":true'; then ok "Health check passed"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; return 0; fi; if ! kill -0 "$pid" 2>/dev/null; then break; fi; sleep 1; done; cat "$log_file"; kill "$pid" 2>/dev/null || true; rm -f "$log_file"; die "Application health check failed.";
  fi
 }
 install_app(){ check_os; require_root; cd /; install_deps; setup_user; clone_or_update; prepare_app; if [[ "$WORKSPACE_MODE" != true ]]; then load_env; chown -R "$APP_USER:$(id -gn "$APP_USER")" "$APP_DIR"; chmod 600 "$APP_DIR/.env"; write_service; write_nginx; nginx -t; start_service; nginx -t; systemctl reload nginx; fi; health_check; }
