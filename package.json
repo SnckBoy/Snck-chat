@@ -5,12 +5,12 @@
   "description": "Snck Chat - real-time username-first chat platform",
   "main": "src/server.js",
   "scripts": {
-    "dev": "node --watch src/server.js",
-    "start": "node src/server.js",
+    "dev": "node --watch src/launcher.js",
+    "start": "node src/launcher.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
     "prisma:dev": "prisma migrate dev",
-    "check": "node --check src/server.js",
+    "check": "node --check src/server.js && node --check src/launcher.js && node --check public/dm-open.js",
     "test": "node --test"
   },
   "dependencies": {
