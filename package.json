@@ -7,10 +7,11 @@
   "scripts": {
     "dev": "node --watch src/launcher.js",
     "start": "node src/launcher.js",
+    "postinstall": "node scripts/enable-open-dms.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
     "prisma:dev": "prisma migrate dev",
-    "check": "node --check src/server.js && node --check src/launcher.js && node --check public/dm-open.js",
+    "check": "node --check src/server.js && node --check src/launcher.js && node --check public/dm-open.js && node --check scripts/enable-open-dms.js",
     "test": "node --test"
   },
   "dependencies": {
